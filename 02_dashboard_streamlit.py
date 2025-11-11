@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 import time
+import pg8000
 
 # ============================================================================
 # CONFIGURACIÓN DE LA PÁGINA
@@ -28,13 +29,20 @@ st.set_page_config(
 
 def get_database_connection():
     """Crear conexión a PostgreSQL"""
-    return psycopg2.connect(
-        host='karenserver.postgres.database.azure.com',
-        database='transit_streaming',
-        user='admin_karen',
-        port=5432,
-        password = 'Tiendala60'
-    )
+    return pg8000.connect(
+    host="karenserver.postgres.database.azure.com",
+    database="transit_streaming",
+    user="admin_karen",
+    password="Tiendala60",
+    port=5432)
+
+# psycopg2.connect(
+#         host='karenserver.postgres.database.azure.com',
+#         database='transit_streaming',
+#         user='admin_karen',
+#         port=5432,
+#         password = 'Tiendala60'
+#     )
 
 # ============================================================================
 # FUNCIONES PARA OBTENER DATOS

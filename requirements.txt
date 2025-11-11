@@ -1,7 +1,6 @@
 # Dependencias del Proyecto de Transporte Público en Tiempo Real
 
-# Base de datos
-psycopg2-binary==2.9.9
+pg8000
 
 # API y requests
 requests==2.31.0
