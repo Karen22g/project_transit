@@ -14,7 +14,7 @@ protobuf==4.25.1
 streamlit==1.29.0
 plotly==5.18.0
 folium==0.14.0
-psycopg2-binary==2.9.9
+#psycopg2-binary==2.9.9
 streamlit-folium==0.16.0
 
 # Data processing
