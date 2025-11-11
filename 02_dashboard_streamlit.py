@@ -3,6 +3,7 @@ DASHBOARD DE MONITOREO EN TIEMPO REAL - TRANSPORTE PÚBLICO SF BAY AREA
 Visualización interactiva de datos de la API 511.org
 """
 
+from scipy import stats
 import streamlit as st
 import pandas as pd
 #import psycopg2
@@ -18,7 +19,6 @@ import pg8000
 
 st.set_page_config(
     page_title="🚌 Transit Monitor - SF Bay Area",
-    page_icon="🚌",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -64,10 +64,11 @@ def get_active_vehicles():
                 heading,
                 timestamp
             FROM vehicle_positions
-            WHERE timestamp > NOW() - INTERVAL '5 minutes'
-            ORDER BY timestamp DESC
+            WHERE created_at > NOW() - INTERVAL '5 minutes'
+            ORDER BY created_at DESC
         """
         df = pd.read_sql(query, conn)
+        print(df)
         return df
     finally:
         conn.close()
@@ -89,7 +90,7 @@ def get_statistics():
         cursor.execute("""
             SELECT COUNT(DISTINCT vehicle_id) 
             FROM vehicle_positions
-            WHERE timestamp > NOW() - INTERVAL '5 minutes'
+            WHERE created_at > NOW() - INTERVAL '5 minutes'
         """)
         stats['active_vehicles'] = cursor.fetchone()[0]
         
@@ -97,7 +98,7 @@ def get_statistics():
         cursor.execute("""
             SELECT agency_id, COUNT(DISTINCT vehicle_id) as count
             FROM vehicle_positions
-            WHERE timestamp > NOW() - INTERVAL '5 minutes'
+            WHERE created_at > NOW() - INTERVAL '5 minutes'
             GROUP BY agency_id
         """)
         stats['by_agency'] = dict(cursor.fetchall())
@@ -106,19 +107,22 @@ def get_statistics():
         cursor.execute("""
             SELECT AVG(speed) 
             FROM vehicle_positions
-            WHERE timestamp > NOW() - INTERVAL '5 minutes'
+            WHERE created_at > NOW() - INTERVAL '5 minutes'
             AND speed IS NOT NULL
         """)
+
         avg_speed = cursor.fetchone()[0]
-        stats['avg_speed'] = round(avg_speed, 2) if avg_speed else 0
+        print("Average speed (m/s):", avg_speed)
+
+        if avg_speed:
+            avg_speed_mph = float(avg_speed) * 2.23694  # conversión de m/s a mi/h
+            stats['avg_speed'] = round(avg_speed_mph, 2)
+        else:
+            stats['avg_speed'] = 0
         
         # Última actualización
-        cursor.execute("""
-            SELECT MAX(timestamp) 
-            FROM vehicle_positions
-        """)
-        stats['last_update'] = cursor.fetchone()[0]
-        
+        cursor.execute("""SELECT MAX(timestamp) FROM vehicle_positions""")
+        stats['last_update'] = cursor.fetchone()[0]  # mantener datetime real
         return stats
     finally:
         cursor.close()
@@ -137,7 +141,7 @@ def get_route_statistics():
                 AVG(speed) as avg_speed,
                 COUNT(*) as total_records
             FROM vehicle_positions
-            WHERE timestamp > NOW() - INTERVAL '1 hour'
+            WHERE created_at > NOW() - INTERVAL '1 hour'
             AND route_id IS NOT NULL
             GROUP BY route_id, agency_id
             ORDER BY vehicles DESC
@@ -159,7 +163,7 @@ def get_hourly_activity():
                 COUNT(DISTINCT vehicle_id) as vehicles,
                 COUNT(*) as records
             FROM vehicle_positions
-            WHERE timestamp > NOW() - INTERVAL '24 hours'
+            WHERE created_at > NOW() - INTERVAL '24 hours'
             GROUP BY hour
             ORDER BY hour
         """
@@ -232,21 +236,31 @@ try:
     with col3:
         st.metric(
             label="⚡ Velocidad Promedio",
-            value=f"{stats['avg_speed']} km/h",
+            value=f"{stats['avg_speed']} mi/h",
             delta=None
         )
     
     with col4:
-        if stats['last_update']:
-            time_diff = datetime.now() - stats['last_update'].replace(tzinfo=None)
-            seconds_ago = int(time_diff.total_seconds())
+        last_update = stats.get('last_update')
+        print("Última actualización cruda:", last_update)
+
+        if last_update:
+            # Asegurar que sea tipo datetime sin zona horaria
+            last_update = last_update.replace(tzinfo=None)
+            time_diff = datetime.now() - last_update
+
+            # Formatear fecha y hora legibles
+            formatted_time = last_update.strftime("%Y-%m-%d %H:%M:%S")
+
             st.metric(
                 label="🕐 Última Actualización",
-                value=f"Hace {seconds_ago}s",
-                delta=stats['last_update'].strftime("%H:%M:%S")
+                value=f"{formatted_time}",
+                delta=None  # sin delta
             )
+
         else:
-            st.metric(label="🕐 Última Actualización", value="N/A")
+            st.metric(label="🕐 Última Actualización", value="Sin datos")
+
     
     # ============================================================================
     # SECCIÓN 2: VEHÍCULOS POR AGENCIA

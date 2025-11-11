@@ -5,6 +5,7 @@ Script que obtiene datos en tiempo real de la API de 511.org y los inserta en Po
 
 import requests
 import psycopg2
+from geopy.distance import geodesic
 from psycopg2.extras import execute_batch
 import time
 from datetime import datetime
@@ -279,17 +280,56 @@ class TransitDatabase:
         self.db_config = db_config
         self.conn = psycopg2.connect(**db_config)
     
+    def compute_speed(self, vehicle):
+        """Calcular velocidad (mi/h) a partir del cambio de posición y tiempo."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT latitude, longitude, timestamp
+                FROM vehicle_positions
+                WHERE vehicle_id = %s
+                ORDER BY timestamp DESC
+                LIMIT 1
+            """, (vehicle['vehicle_id'],))
+            last = cursor.fetchone()
+            cursor.close()
+
+            if not last:
+                print("No previous position found for vehicle", vehicle['vehicle_id'])
+                return None  # No hay posición previa, no se puede calcular
+
+            last_lat, last_lon, last_time = last
+            dist_m = geodesic((vehicle['latitude'], vehicle['longitude']),
+                              (last_lat, last_lon)).meters
+            delta_t = (vehicle['timestamp'] - last_time).total_seconds()
+            if delta_t <= 0:
+                return None
+
+            speed_m_s = dist_m / delta_t
+            speed_mph = speed_m_s * 2.23694  # Convertir m/s a mi/h
+            return round(speed_mph, 2)
+        except Exception:
+            return None
+
     def insert_vehicle_positions(self, vehicles):
         """Insertar posiciones de vehículos en batch"""
         if not vehicles:
             return 0
-        
+
         cursor = self.conn.cursor()
-        
+
+        # 🚀 NUEVO: calcular velocidad si viene como None
+        i = 0
+        for v in vehicles:
+            if v['speed'] is None:
+                v['speed'] = self.compute_speed(v)
+            i += 1
+            print('calculando v de', i, 'de', len(vehicles), end='\r')
+
         # Contar registros antes de insertar
         cursor.execute("SELECT COUNT(*) FROM vehicle_positions")
         count_before = cursor.fetchone()[0]
-        
+
         insert_query = """
             INSERT INTO vehicle_positions 
             (vehicle_id, route_id, trip_id, agency_id, latitude, longitude, 
@@ -297,25 +337,25 @@ class TransitDatabase:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (vehicle_id, timestamp) DO NOTHING
         """
-        
+
         data = [
             (v['vehicle_id'], v['route_id'], v['trip_id'], v['agency_id'],
              v['latitude'], v['longitude'], v['speed'], v['heading'], v['timestamp'])
             for v in vehicles
         ]
-        
+
         execute_batch(cursor, insert_query, data)
-        
+
         # Contar registros después de insertar
         cursor.execute("SELECT COUNT(*) FROM vehicle_positions")
         count_after = cursor.fetchone()[0]
-        
+
         inserted = count_after - count_before
         print("se insertaron", inserted, "registros nuevos en vehicle_positions.")
-        
+
         self.conn.commit()
         cursor.close()
-        
+
         return inserted
     
     def update_route_info(self, vehicles):
@@ -343,8 +383,6 @@ class TransitDatabase:
                     total_vehicles = EXCLUDED.total_vehicles,
                     last_update = CURRENT_TIMESTAMP
             """, (route_id, agency_id, len(route_vehicles)))
-
-            print(f"Ruta {route_id} actualizada con {len(route_vehicles)} vehículos.")
         
         self.conn.commit()
         cursor.close()
