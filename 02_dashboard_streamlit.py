@@ -3,7 +3,10 @@ DASHBOARD DE MONITOREO EN TIEMPO REAL - TRANSPORTE PÚBLICO SF BAY AREA
 Visualización interactiva de datos de la API 511.org
 """
 
+import altair as alt
+import folium
 from scipy import stats
+from sqlalchemy import create_engine
 import streamlit as st
 import pandas as pd
 #import psycopg2
@@ -12,13 +15,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import time
 import pg8000
+from streamlit_folium import st_folium
 
 # ============================================================================
 # CONFIGURACIÓN DE LA PÁGINA
 # ============================================================================
 
 st.set_page_config(
-    page_title="🚌 Transit Monitor - SF Bay Area",
+    page_title="🚌 Tránsito actual en San Francisco",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -62,9 +66,11 @@ def get_active_vehicles():
                 longitude,
                 speed,
                 heading,
-                timestamp
+                timestamp,
+                created_at,
+                trip_id
             FROM vehicle_positions
-            WHERE created_at > NOW() - INTERVAL '5 minutes'
+            WHERE created_at > NOW() - INTERVAL '10 minutes'
             ORDER BY created_at DESC
         """
         df = pd.read_sql(query, conn)
@@ -177,8 +183,8 @@ def get_hourly_activity():
 # ============================================================================
 
 # Título
-st.title("🚌 Monitor de Transporte Público en Tiempo Real")
-st.markdown("**Área de la Bahía de San Francisco** | Fuente: 511.org API")
+st.title("🚌 Tránsito actual en San Francisco")
+st.markdown("**Bahía de San Francisco** | Fuente: 511.org API")
 
 # Barra lateral
 st.sidebar.title("⚙️ Configuración")
@@ -209,6 +215,9 @@ try:
     # Filtrar por agencias seleccionadas
     if selected_agencies:
         vehicles_df = vehicles_df[vehicles_df['agency_id'].isin(selected_agencies)]
+    
+    df = vehicles_df.copy()
+    df['created_at'] = pd.to_datetime(df['created_at'])
     
     # ============================================================================
     # SECCIÓN 1: KPIs PRINCIPALES
@@ -261,226 +270,261 @@ try:
         else:
             st.metric(label="🕐 Última Actualización", value="Sin datos")
 
-    
     # ============================================================================
-    # SECCIÓN 2: VEHÍCULOS POR AGENCIA
+    # SECCIÓN 2: Agencias
     # ============================================================================
-    
+
+    df["date"] = df["timestamp"].dt.date
+    df["hour"] = df["timestamp"].dt.hour
+    df["week"] = df["timestamp"].dt.isocalendar().week
+    df["month"] = df["timestamp"].dt.month
+    df["is_active"] = df["created_at"] > (pd.Timestamp.now() - pd.Timedelta(minutes=5))
     st.markdown("---")
+    st.subheader("🏢 Resumen por Agencia")
+    
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        st.subheader("🏢 Vehículos por Agencia")
-        
-        agency_names = {
-            'SF': 'SF Muni',
-            'AC': 'AC Transit',
-            'CT': 'Caltrain'
-        }
-        
-        for agency_id in ['SF', 'AC', 'CT']:
-            count = stats['by_agency'].get(agency_id, 0)
-            st.metric(
-                label=agency_names[agency_id],
-                value=f"{count} vehículos"
+        agency_summary = (
+            df.groupby("agency_id")
+            .agg(
+                total_vehículos=("vehicle_id", "nunique"),
+                activos=("is_active", "sum"),
+                rutas=("route_id", "nunique")
             )
+            .reset_index()
+        )
+        agency_summary["% uso"] = (
+            100 * agency_summary["activos"] / agency_summary["total_vehículos"]
+        ).round(1)
+        # Preparar datos para pie chart
+        pie_data = agency_summary.copy()
+        pie_data = pie_data[["agency_id", "% uso"]].rename(columns={"agency_id": "Agencia", "% uso": "Porcentaje"})
+
+        # Crear diagrama de pastel
+        pie_chart = alt.Chart(pie_data).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta(field="Porcentaje", type="quantitative"),
+            color=alt.Color(field="Agencia", type="nominal"),
+            tooltip=["Agencia", "Porcentaje"]
+        ).properties(
+            width=400,
+            height=400,
+            title="Porcentaje de vehículos activos por agencia"
+        )
+
+        st.altair_chart(pie_chart, use_container_width=True)
+        
+    with col2:
+        fig_routes = px.bar(
+            agency_summary,
+            x="agency_id",
+            y="rutas",
+            color="rutas",
+            title="Número de rutas cubiertas por cada agencia",
+        )
+        st.plotly_chart(fig_routes, use_container_width=True)
+    
+    agency_summary = agency_summary.rename(columns={
+        "agency_id": "Agencia",
+        "total_vehículos": "Total de Vehículos",
+        "activos": "Vehículos Activos",
+        "rutas": "Rutas"
+    })
+
+    st.dataframe(agency_summary, use_container_width=True)
+
+    # 4️⃣ Mapa: ubicación actual de vehículos por agencia
+    st.subheader("🗺️ Ubicación actual de los vehículos activos")
+
+    df_active = df[df["is_active"] & df["latitude"].notna() & df["longitude"].notna()]
+
+    if not df_active.empty:
+        m = folium.Map(
+            location=[df_active["latitude"].mean(), df_active["longitude"].mean()],
+            zoom_start=10,
+            tiles="cartodbpositron"
+        )
+
+        colors = ["red", "blue", "green", "purple", "orange", "darkred", "cadetblue"]
+        color_map = {a: colors[i % len(colors)] for i, a in enumerate(df_active["agency_id"].unique())}
+
+        for _, row in df_active.iterrows():
+            folium.CircleMarker(
+                location=[row["latitude"], row["longitude"]],
+                radius=4,
+                color=color_map.get(row["agency_id"], "gray"),
+                fill=True,
+                fill_opacity=0.8,
+                popup=(
+                    f"🚍 Vehículo: {row['vehicle_id']}<br>"
+                    f"Agencia: {row['agency_id']}<br>"
+                    f"Ruta: {row['route_id']}<br>"
+                    f"Hora: {row['timestamp'].strftime('%H:%M:%S')}"
+                ),
+            ).add_to(m)
+
+        st_folium(m, height=500, width=1500)
+    else:
+        st.info("No hay vehículos activos con coordenadas disponibles para mostrar en el mapa.")
+
+    # ============================================================================
+    # SECCIÓN 3: Vehículos
+    # ============================================================================
+
+    st.markdown("---")
+    st.subheader("📊 Resumen general por vehículo")
+    
+    col1, col2 = st.columns([1, 2], gap = 'medium', vertical_alignment='bottom')
+
+    with col1:
+        # Selector de periodo
+        time_scale = st.selectbox("Selecciona el período:", ["Día", "Semana", "Mes"])
+
+        # Agrupar según el periodo
+        if time_scale == "Día":
+            active_vehicle = (
+                df.groupby(["vehicle_id", "date"])['trip_id']
+                .nunique()
+                .reset_index(name="viajes")
+                .sort_values("viajes", ascending=False)
+            )
+            period_label = "hoy"
+        elif time_scale == "Semana":
+            active_vehicle = (
+                df.groupby(["vehicle_id", "week"])['trip_id']
+                .nunique()
+                .reset_index(name="viajes")
+                .sort_values("viajes", ascending=False)
+            )
+            period_label = "esta semana"
+        else:
+            active_vehicle = (
+                df.groupby(["vehicle_id", "month"])['trip_id']
+                .nunique()
+                .reset_index(name="viajes")
+                .sort_values("viajes", ascending=False)
+            )
+            period_label = "este mes"
+
+        # Obtener top 5 vehículos
+        top5 = active_vehicle.groupby("vehicle_id")["viajes"].sum().sort_values(ascending=False).head(5).reset_index()
+        top_vehicle = top5.iloc[0]["vehicle_id"]
+        df_speed_avg = df.groupby(["vehicle_id", "agency_id"])["speed"].mean().reset_index()
+        df_speed_avg["speed"] = df_speed_avg["speed"].fillna(0)  # rellenar NaN con 0
+
+        # Mostrar métrica del top_vehicle
+        df_top = df_speed_avg[df_speed_avg["vehicle_id"] == top_vehicle]
+        avg_speed_top = df_top["speed"].values[0] if not df_top.empty else 0
+
+        # Mostrar métrica
+        st.metric(f"Velocidad promedio del vehículo más activo: #{top_vehicle} (mi/h)", round(avg_speed_top, 2))
+
+        # Diagrama de barras del top 5
+        bar_chart = alt.Chart(top5).mark_bar(color="#1f77b4").encode(
+            x=alt.X("vehicle_id:N", title="ID del Vehículo"),
+            y=alt.Y("viajes:Q", title="Número de viajes"),
+            tooltip=["vehicle_id", "viajes"]
+        ).properties(
+            width=600,
+            height=400,
+            title=f"Top 5 vehículos más activos ({period_label})"
+        )
+
+        st.altair_chart(bar_chart, use_container_width=True)
     
     with col2:
-        st.subheader("📈 Distribución por Agencia")
-        if stats['by_agency']:
-            agency_data = pd.DataFrame([
-                {'Agencia': agency_names[k], 'Vehículos': v} 
-                for k, v in stats['by_agency'].items()
-            ])
-            
-            fig = px.pie(
-                agency_data,
-                values='Vehículos',
-                names='Agencia',
-                color='Agencia',
-                color_discrete_map={
-                    'SF Muni': '#E31837',
-                    'AC Transit': '#00A94F',
-                    'Caltrain': '#D2232A'
-                },
-                hole=0.4
-            )
-            fig.update_layout(height=300, margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+        # Diagrama de dispersión
+        scatter = alt.Chart(df_speed_avg).mark_circle(size=100).encode(
+            x=alt.X("vehicle_id:N", title="ID del Vehículo"),
+            y=alt.Y("speed:Q", title="Velocidad Promedio (mi/h)"),
+            color=alt.Color("agency_id:N", title="Agencia"),
+            tooltip=[
+                alt.Tooltip("vehicle_id:N", title="Vehículo"),
+                alt.Tooltip("agency_id:N", title="Agencia"),
+                alt.Tooltip("speed:Q", title="Velocidad Promedio (mi/h)", format=".2f")
+            ]
+        ).properties(
+            width=700,
+            height=400,
+            title="Velocidad promedio por vehículo"
+        ).interactive()  # permite hacer zoom y pan
+
+        st.altair_chart(scatter, use_container_width=True)
     
-    # ============================================================================
-    # SECCIÓN 3: MAPA DE VEHÍCULOS
-    # ============================================================================
-    
-    st.markdown("---")
-    st.subheader("🗺️ Posiciones de Vehículos en Tiempo Real")
-    
-    if not vehicles_df.empty:
-        # Preparar datos para el mapa
-        map_df = vehicles_df.copy()
-        
-        # Asignar colores por agencia
-        color_map = {'SF': 'red', 'AC': 'green', 'CT': 'blue'}
-        map_df['color'] = map_df['agency_id'].map(color_map)
-        
-        # Crear texto para hover
-        map_df['hover_text'] = (
-            "Vehículo: " + map_df['vehicle_id'].astype(str) + "<br>" +
-            "Ruta: " + map_df['route_id'].fillna('N/A').astype(str) + "<br>" +
-            "Agencia: " + map_df['agency_id'].astype(str) + "<br>" +
-            "Velocidad: " + map_df['speed'].fillna(0).round(1).astype(str) + " km/h<br>" +
-            "Rumbo: " + map_df['heading'].fillna(0).astype(str) + "°"
-        )
-        
-        # Crear mapa con Plotly
-        fig = go.Figure()
-        
-        for agency in map_df['agency_id'].unique():
-            agency_data = map_df[map_df['agency_id'] == agency]
-            
-            fig.add_trace(go.Scattermapbox(
-                lat=agency_data['latitude'],
-                lon=agency_data['longitude'],
-                mode='markers',
-                marker=dict(
-                    size=8,
-                    color=agency_data['color'].iloc[0],
-                    opacity=0.7
-                ),
-                text=agency_data['hover_text'],
-                hoverinfo='text',
-                name=agency
-            ))
-        
-        # Configurar mapa
-        fig.update_layout(
-            mapbox=dict(
-                style="open-street-map",
-                center=dict(
-                    lat=map_df['latitude'].mean(),
-                    lon=map_df['longitude'].mean()
-                ),
-                zoom=10
-            ),
-            height=600,
-            margin=dict(l=0, r=0, t=0, b=0),
-            showlegend=True,
-            legend=dict(
-                yanchor="top",
-                y=0.99,
-                xanchor="left",
-                x=0.01,
-                bgcolor="rgba(255,255,255,0.8)"
-            )
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Estadísticas del mapa
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.info(f"🔴 SF Muni: {len(map_df[map_df['agency_id']=='SF'])} vehículos")
-        with col2:
-            st.success(f"🟢 AC Transit: {len(map_df[map_df['agency_id']=='AC'])} vehículos")
-        with col3:
-            st.error(f"🔵 Caltrain: {len(map_df[map_df['agency_id']=='CT'])} vehículos")
-    else:
-        st.warning("⚠️ No hay vehículos activos en este momento")
-    
-    # ============================================================================
-    # SECCIÓN 4: RUTAS MÁS ACTIVAS
-    # ============================================================================
-    
-    st.markdown("---")
-    st.subheader("🚏 Top 15 Rutas Más Activas (Última Hora)")
-    
-    route_stats = get_route_statistics()
-    
-    if not route_stats.empty:
-        # Gráfico de barras
-        fig = px.bar(
-            route_stats,
-            x='route_id',
-            y='vehicles',
-            color='agency_id',
-            color_discrete_map={'SF': '#E31837', 'AC': '#00A94F', 'CT': '#D2232A'},
-            labels={'vehicles': 'Vehículos', 'route_id': 'Ruta'},
-            title="Vehículos Activos por Ruta"
-        )
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Tabla detallada
-        st.dataframe(
-            route_stats.rename(columns={
-                'route_id': 'Ruta',
-                'agency_id': 'Agencia',
-                'vehicles': 'Vehículos',
-                'avg_speed': 'Velocidad Prom. (km/h)',
-                'total_records': 'Registros'
-            }).style.format({
-                'Velocidad Prom. (km/h)': '{:.1f}',
-                'Vehículos': '{:.0f}',
-                'Registros': '{:.0f}'
-            }),
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("📊 No hay suficientes datos para mostrar estadísticas de rutas")
-    
-    # ============================================================================
-    # SECCIÓN 5: ACTIVIDAD HISTÓRICA
-    # ============================================================================
-    
-    st.markdown("---")
-    st.subheader("📅 Actividad en las Últimas 24 Horas")
-    
-    hourly_data = get_hourly_activity()
-    
-    if not hourly_data.empty:
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=hourly_data['hour'],
-            y=hourly_data['vehicles'],
-            mode='lines+markers',
-            name='Vehículos Únicos',
-            line=dict(color='#E31837', width=3),
-            marker=dict(size=8)
-        ))
-        
-        fig.update_layout(
-            xaxis_title="Hora",
-            yaxis_title="Vehículos Activos",
-            height=350,
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("📈 Acumulando datos históricos...")
-    
-    # ============================================================================
-    # FOOTER
-    # ============================================================================
-    
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style='text-align: center; color: gray; padding: 20px;'>
-            <p>🚌 Sistema de Monitoreo de Transporte Público en Tiempo Real</p>
-            <p>Datos proporcionados por <a href='https://511.org' target='_blank'>511.org</a></p>
-            <p>Última actualización: {}</p>
-        </div>
-        """.format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        unsafe_allow_html=True
+    df_max_speed = df.groupby(["vehicle_id", "agency_id", "trip_id", "route_id"])["speed"].max().reset_index()
+
+    # Calcular velocidad promedio por vehículo
+    df_avg_speed = df.groupby(["vehicle_id", "agency_id"])["speed"].mean().reset_index()
+    df_avg_speed["speed"] = df_avg_speed["speed"].fillna(0)
+
+    # Combinar velocidad promedio con la info de max speed
+    df_top_speed = pd.merge(
+        df_avg_speed,
+        df_max_speed,
+        on=["vehicle_id", "agency_id"],
+        suffixes=("_avg", "_max")
     )
-    
-    # Auto-refresh
-    if auto_refresh:
-        time.sleep(refresh_interval)
-        st.rerun()
+
+    # Tomar top 5 por velocidad promedio
+    top5_speed = df_top_speed.sort_values("speed_avg", ascending=False).head(5)
+
+    st.subheader("🏎️ Top 5 vehículos por velocidad promedio")
+    st.write(
+        "Estos son los vehículos con mayor velocidad promedio, mostrando también la agencia, trip y ruta donde alcanzaron su velocidad máxima:"
+    )
+
+    # Mostrar tabla
+    st.dataframe(top5_speed[["vehicle_id", "agency_id", "speed_avg", "trip_id", "route_id", "speed_max"]].rename(
+        columns={
+            "vehicle_id": "Vehículo",
+            "agency_id": "Agencia",
+            "speed_avg": "Velocidad Prom (mi/h)",
+            "trip_id": "Trip ID",
+            "route_id": "Ruta",
+            "speed_max": "Velocidad Máx (mi/h)"
+        }
+    ).style.format({
+        "Velocidad Prom (mi/h)": "{:.2f}",
+        "Velocidad Máx (mi/h)": "{:.2f}"
+    }))
+
+    st.columns([1, 2], gap = 'medium', vertical_alignment='bottom')
+
+    with col1:
+        # ============================================
+        # 5️⃣ Actividad de vehículos durante el día
+        # ============================================
+        st.subheader("⏰ Actividad horaria de la flota")
+
+        activity_hour = df.groupby("hour")["vehicle_id"].nunique().reset_index(name="vehículos activos")
+        fig_hour_activity = px.line(
+            activity_hour,
+            x="hour",
+            y="vehículos activos",
+            markers=True,
+            title="Número de vehículos activos por hora del día",
+        )
+        fig_hour_activity.update_layout(xaxis_title="Hora del día", yaxis_title="Vehículos activos")
+        st.plotly_chart(fig_hour_activity, width=700, use_container_width=True)
+
+    with col2:
+        # ============================================
+        # 6️⃣ Velocidad promedio por hora
+        # ============================================
+        st.subheader("📈 Velocidad promedio por hora del día")
+
+        df_speed_hour = (
+            df.groupby("hour")["speed"].mean().reset_index()
+        )
+        fig_speed_hour = px.line(
+            df_speed_hour,
+            x="hour",
+            y="speed",
+            markers=True,
+            title="Velocidad promedio por hora del día (mi/h)",
+        )
+        fig_speed_hour.update_layout(xaxis_title="Hora del día", yaxis_title="Velocidad promedio (mi/h)")
+        st.plotly_chart(fig_speed_hour, width=700, use_container_width=True)
 
 except Exception as e:
     st.error(f"❌ Error al conectar con la base de datos: {e}")
